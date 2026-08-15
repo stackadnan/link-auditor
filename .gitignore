@@ -1,0 +1,28 @@
+# Build artifacts
+/link-auditor
+/link-auditor.exe
+/dist/
+/bin/
+
+# Go build/test cache and coverage output
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Generated reports produced by running the tool locally
+*.report.json
+*.report.md
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Environment files that might carry secrets
+.env
+.env.local
