@@ -1,4 +1,4 @@
-ki# link-auditor
+# link-auditor
 
 **link-auditor** is a fast, concurrent Go command-line tool that crawls a website, finds broken links, audits SSL/TLS certificate expiration, and produces reports in table, JSON, or Markdown format.
 
@@ -59,15 +59,6 @@ link-auditor scan https://example.com
 - `--ignore-external` - skip external links
 - `--verbose` - print debug logs
 
-## Development
-
-```bash
-go build ./...
-go vet ./...
-go test ./...
-go test -race ./...
-gofmt -w .
-```
 
 
 
