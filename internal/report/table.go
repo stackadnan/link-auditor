@@ -90,6 +90,8 @@ func (f *TableFormatter) statusCell(r crawler.Result) string {
 
 func tableNotes(r crawler.Result) string {
 	switch {
+	case r.Skipped && r.SkipReason != "":
+		return "skipped: " + r.SkipReason
 	case r.Error != "":
 		return r.Error
 	case r.RedirectTo != "":
@@ -101,6 +103,8 @@ func tableNotes(r crawler.Result) string {
 
 func (f *TableFormatter) renderSummary(w io.Writer, s Summary) {
 	fmt.Fprintln(w, f.style(color.Bold, "Summary"))
+	fmt.Fprintf(w, "  Target:     %s\n", s.Target)
+	fmt.Fprintf(w, "  Pages:      %d crawled\n", s.PagesCrawled)
 	fmt.Fprintf(w, "  Checked:    %d  (%s internal / %s external)\n",
 		s.TotalChecked, f.style(color.FgCyan, strconv.Itoa(s.Internal)), f.style(color.FgCyan, strconv.Itoa(s.External)))
 	fmt.Fprintf(w, "  OK:         %s\n", f.style(color.FgGreen, strconv.Itoa(s.OK)))
@@ -110,6 +114,10 @@ func (f *TableFormatter) renderSummary(w io.Writer, s Summary) {
 		fmt.Fprintf(w, "  Skipped:    %d\n", s.Skipped)
 	}
 	fmt.Fprintf(w, "  Duration:   %s\n", s.Duration.Round(time.Millisecond))
+	if s.PagesLimited {
+		fmt.Fprintf(w, "  %s crawl stopped at the --max-pages limit; results are a partial view of the site\n",
+			f.style(color.FgYellow, "Note:"))
+	}
 }
 
 func (f *TableFormatter) renderSSL(w io.Writer, info *checker.SSLInfo) {

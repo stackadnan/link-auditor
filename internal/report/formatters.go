@@ -23,7 +23,14 @@ type Formatter interface {
 // and shared across every report format so each Formatter doesn't need to
 // recompute it independently.
 type Summary struct {
-	TotalChecked int           `json:"total_checked"`
+	// Target is the normalized URL the scan started from.
+	Target       string `json:"target"`
+	TotalChecked int    `json:"total_checked"`
+	// PagesCrawled counts internal HTML pages whose body was parsed for
+	// outbound links (crawler.Result.Crawled), a narrower count than
+	// TotalChecked: every checked link is a "link", but only a crawled
+	// page is also a "page".
+	PagesCrawled int           `json:"pages_crawled"`
 	OK           int           `json:"ok"`
 	Redirects    int           `json:"redirects"`
 	Broken       int           `json:"broken"`
@@ -31,13 +38,23 @@ type Summary struct {
 	Internal     int           `json:"internal"`
 	External     int           `json:"external"`
 	Duration     time.Duration `json:"duration_ns"`
+	// PagesLimited is true when --max-pages caused one or more discovered
+	// URLs to be dropped rather than checked, i.e. the results below are a
+	// partial view of the site rather than its entirety.
+	PagesLimited bool `json:"pages_limited,omitempty"`
 }
 
 // BuildSummary aggregates a completed scan's results into a Summary.
-func BuildSummary(results []crawler.Result, duration time.Duration) Summary {
-	s := Summary{Duration: duration}
+// pagesLimited should be the crawler's own Crawler.PagesLimited() for this
+// run, since whether the page budget was exhausted cannot be derived from
+// results alone (a dropped URL never becomes a Result).
+func BuildSummary(target string, results []crawler.Result, duration time.Duration, pagesLimited bool) Summary {
+	s := Summary{Target: target, Duration: duration, PagesLimited: pagesLimited}
 	for _, r := range results {
 		s.TotalChecked++
+		if r.Crawled {
+			s.PagesCrawled++
+		}
 
 		switch {
 		case r.Skipped:

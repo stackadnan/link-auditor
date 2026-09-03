@@ -45,13 +45,19 @@ func (f *MarkdownFormatter) Generate(w io.Writer, results []crawler.Result, summ
 func writeMarkdownSummary(w io.Writer, s Summary) {
 	fmt.Fprintf(w, "## Summary\n\n")
 	fmt.Fprintf(w, "| Metric | Value |\n|---|---|\n")
-	fmt.Fprintf(w, "| URLs checked | %d |\n", s.TotalChecked)
+	fmt.Fprintf(w, "| Target | %s |\n", escapeMarkdown(s.Target))
+	fmt.Fprintf(w, "| Pages crawled | %d |\n", s.PagesCrawled)
+	fmt.Fprintf(w, "| Links checked | %d |\n", s.TotalChecked)
 	fmt.Fprintf(w, "| OK (2xx) | %d |\n", s.OK)
 	fmt.Fprintf(w, "| Redirects (3xx) | %d |\n", s.Redirects)
 	fmt.Fprintf(w, "| Broken (4xx/5xx/errors) | %d |\n", s.Broken)
 	fmt.Fprintf(w, "| Skipped | %d |\n", s.Skipped)
 	fmt.Fprintf(w, "| Internal / External | %d / %d |\n", s.Internal, s.External)
-	fmt.Fprintf(w, "| Duration | %s |\n\n", s.Duration.Round(time.Millisecond))
+	fmt.Fprintf(w, "| Duration | %s |\n", s.Duration.Round(time.Millisecond))
+	if s.PagesLimited {
+		fmt.Fprintf(w, "| Limited | ⚠️ crawl stopped at the `--max-pages` limit; results are a partial view of the site |\n")
+	}
+	fmt.Fprintf(w, "\n")
 }
 
 func writeMarkdownSSL(w io.Writer, sslInfo *checker.SSLInfo) {
@@ -83,6 +89,8 @@ func writeMarkdownSSL(w io.Writer, sslInfo *checker.SSLInfo) {
 
 func markdownNotes(r crawler.Result) string {
 	switch {
+	case r.Skipped && r.SkipReason != "":
+		return "skipped: " + escapeMarkdown(r.SkipReason)
 	case r.Error != "":
 		return escapeMarkdown(r.Error)
 	case r.RedirectTo != "":

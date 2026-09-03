@@ -8,11 +8,28 @@ import (
 	"fmt"
 	"net"
 	"time"
+
+	"github.com/stackadnan/link-auditor/internal/netguard"
 )
 
-// WarningThreshold is how far out from expiration a certificate is flagged
-// as "expiring soon".
+// WarningThreshold is the default warning window used when Options.
+// WarningThreshold is left zero: how far out from expiration a certificate
+// is flagged as "expiring soon". It is configurable per call via
+// Options.WarningThreshold (see the --ssl-warning-days flag).
 const WarningThreshold = 30 * 24 * time.Hour
+
+// Options controls CheckCertificate's behavior.
+type Options struct {
+	// WarningThreshold overrides the default 30-day "expiring soon" window.
+	// Zero means "use WarningThreshold".
+	WarningThreshold time.Duration
+	// AllowPrivateAddresses permits connecting to loopback, private, and
+	// other non-public address space. It defaults to false so that probing
+	// a scan target's certificate is subject to the same SSRF-hardening
+	// policy as the crawler itself (see internal/netguard); pass true only
+	// when the caller has explicitly opted in via --allow-private-addresses.
+	AllowPrivateAddresses bool
+}
 
 // SSLInfo describes the leaf TLS certificate presented by a host.
 type SSLInfo struct {
@@ -39,13 +56,13 @@ type SSLInfo struct {
 // On failure, both a non-nil *SSLInfo (with Error populated, suitable for
 // direct inclusion in a report) and a non-nil error (for callers that want
 // to log or wrap the underlying cause) are returned.
-func CheckCertificate(host string, timeout time.Duration) (*SSLInfo, error) {
+func CheckCertificate(host string, timeout time.Duration, opts Options) (*SSLInfo, error) {
 	addr := host
 	if _, _, err := net.SplitHostPort(addr); err != nil {
 		addr = net.JoinHostPort(host, "443")
 	}
 
-	dialer := &net.Dialer{Timeout: timeout}
+	dialer := &net.Dialer{Timeout: timeout, Control: netguard.DialControl(opts.AllowPrivateAddresses)}
 	conn, err := tls.DialWithDialer(dialer, "tcp", addr, &tls.Config{ServerName: hostOnly(host)})
 	if err != nil {
 		wrapped := fmt.Errorf("connecting to %s: %w", addr, err)
@@ -59,14 +76,20 @@ func CheckCertificate(host string, timeout time.Duration) (*SSLInfo, error) {
 		return &SSLInfo{Host: host, Error: err.Error()}, err
 	}
 
-	return EvaluateCertificate(host, certs[0], time.Now()), nil
+	return EvaluateCertificate(host, certs[0], time.Now(), opts.WarningThreshold), nil
 }
 
 // EvaluateCertificate derives an SSLInfo from a certificate's validity
-// window relative to now. It contains no I/O and is kept separate from
-// CheckCertificate specifically so the expiration and warning-threshold
-// logic can be unit tested without a live network connection.
-func EvaluateCertificate(host string, cert *x509.Certificate, now time.Time) *SSLInfo {
+// window relative to now, flagging it as "expiring soon" once fewer than
+// warningThreshold remains (zero uses the default WarningThreshold). It
+// contains no I/O and is kept separate from CheckCertificate specifically
+// so the expiration and warning-threshold logic can be unit tested without
+// a live network connection.
+func EvaluateCertificate(host string, cert *x509.Certificate, now time.Time, warningThreshold time.Duration) *SSLInfo {
+	if warningThreshold <= 0 {
+		warningThreshold = WarningThreshold
+	}
+
 	remaining := cert.NotAfter.Sub(now)
 	expired := now.After(cert.NotAfter)
 
@@ -78,7 +101,7 @@ func EvaluateCertificate(host string, cert *x509.Certificate, now time.Time) *SS
 		NotAfter:      cert.NotAfter,
 		DaysRemaining: int(remaining.Hours() / 24),
 		Expired:       expired,
-		ExpiringSoon:  !expired && remaining <= WarningThreshold,
+		ExpiringSoon:  !expired && remaining <= warningThreshold,
 	}
 }
 
