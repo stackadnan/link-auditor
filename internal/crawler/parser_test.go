@@ -54,6 +54,11 @@ func TestExtractLinks(t *testing.T) {
 			want: []string{"https://example.com/keep"},
 		},
 		{
+			name: "protocol-relative links inherit the base scheme",
+			html: `<a href="//other.com/page">protocol-relative</a>`,
+			want: []string{"https://other.com/page"},
+		},
+		{
 			name: "self-closing anchor tag",
 			html: `<a href="/self-closed"/>`,
 			want: []string{"https://example.com/self-closed"},

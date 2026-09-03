@@ -14,6 +14,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/stackadnan/link-auditor/internal/netguard"
 )
 
 // LinkType classifies a discovered link relative to the host of the scan's
@@ -27,10 +29,18 @@ const (
 	External LinkType = "external"
 )
 
-// maxRedirectBodyBytes bounds how much of a non-parsed response body is
-// drained to allow connection reuse, protecting against pathologically
-// large responses on links the crawler has no intention of reading fully.
-const maxRedirectBodyBytes = 1 << 20 // 1 MiB
+// defaultMaxBodyBytes bounds how much of a response body the crawler will
+// read when Config.MaxBodyBytes is left zero: enough for the HTML link
+// discovery pages actually need to work with, without letting a
+// pathologically large (or malicious) response drive unbounded memory use.
+// The same limit also bounds how much of a body the crawler drains (see
+// drain) when it isn't parsing the response at all, so a connection can
+// still be returned to the pool for reuse without ever fully buffering an
+// oversized response.
+const defaultMaxBodyBytes = 10 << 20 // 10 MiB
+
+// defaultUserAgent is used when Config.UserAgent is left empty.
+const defaultUserAgent = "link-auditor/dev"
 
 // Result captures the outcome of checking a single URL.
 type Result struct {
@@ -58,6 +68,14 @@ type Result struct {
 	// Skipped is true when the URL was not requested at all, e.g. an
 	// external link with --ignore-external set.
 	Skipped bool `json:"skipped,omitempty"`
+	// SkipReason explains why Skipped is true (e.g. "ignore-external" or
+	// "robots.txt"). Empty when Skipped is false.
+	SkipReason string `json:"skip_reason,omitempty"`
+	// Crawled is true when this result is an internal HTML page whose body
+	// was parsed for outbound links, as opposed to a link that was only
+	// status-checked. Report formatters use it to distinguish "pages
+	// crawled" from "links checked".
+	Crawled bool `json:"crawled,omitempty"`
 }
 
 // Broken reports whether the result represents a link a human should
@@ -104,12 +122,36 @@ type Config struct {
 	// the crawler will follow when discovering new internal links. A
 	// value of 0 checks only the root URL itself.
 	MaxDepth int
+	// MaxPages caps how many distinct URLs the crawl will admit. Once
+	// reached, further newly discovered URLs are dropped rather than
+	// checked; PagesLimited reports whether that happened. Zero means
+	// unlimited, matching the crawler's pre-v0.2.0 behavior.
+	MaxPages int
+	// MaxBodyBytes caps how many bytes of a single response body the
+	// crawler will read, whether to parse it for links or merely drain it
+	// to reuse the connection. Zero uses defaultMaxBodyBytes.
+	MaxBodyBytes int64
 	// Timeout bounds how long a single HTTP request (including any
 	// connection setup) is allowed to take.
 	Timeout time.Duration
+	// UserAgent is sent as the User-Agent header on every request,
+	// including the robots.txt fetch. Empty uses defaultUserAgent; callers
+	// that care about the version-qualified default (the CLI does) should
+	// set this explicitly rather than relying on the package fallback.
+	UserAgent string
 	// IgnoreExternal, when true, skips status checks for links that point
 	// to a different host than the scan target.
 	IgnoreExternal bool
+	// RespectRobots, when true, fetches robots.txt for the scan target's
+	// host once and skips internal URLs it disallows for User-agent: *.
+	// See robots.go for the (deliberately small) subset of the Robots
+	// Exclusion Protocol that is implemented.
+	RespectRobots bool
+	// AllowPrivateAddresses, when true, disables the default refusal to
+	// connect to loopback, private, link-local, and other non-public
+	// address space (see internal/netguard). Leave false unless the scan
+	// target is intentionally internal (e.g. a local CI preview server).
+	AllowPrivateAddresses bool
 	// Logger receives debug output when verbose logging is enabled. If
 	// nil, a no-op logger is used.
 	Logger Logger
@@ -122,6 +164,7 @@ type Crawler struct {
 	client *http.Client
 	state  *State
 	logger Logger
+	robots *robotsRules // nil unless Config.RespectRobots is set
 
 	jobs    chan Job
 	results chan Result
@@ -138,17 +181,34 @@ func New(cfg Config) *Crawler {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 10 * time.Second
 	}
+	if cfg.MaxBodyBytes <= 0 {
+		cfg.MaxBodyBytes = defaultMaxBodyBytes
+	}
+	if cfg.UserAgent == "" {
+		cfg.UserAgent = defaultUserAgent
+	}
 	logger := cfg.Logger
 	if logger == nil {
 		logger = NopLogger{}
 	}
 
+	// A dedicated Transport (rather than http.DefaultTransport) is used so
+	// DialContext can be pinned to a dialer that enforces the
+	// private-address policy on every connection this client makes,
+	// including ones made while following a redirect to a new host.
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = (&net.Dialer{
+		Timeout: cfg.Timeout,
+		Control: netguard.DialControl(cfg.AllowPrivateAddresses),
+	}).DialContext
+
 	return &Crawler{
 		cfg:    cfg,
 		logger: logger,
-		state:  NewState(),
+		state:  NewState(cfg.MaxPages),
 		client: &http.Client{
-			Timeout: cfg.Timeout,
+			Timeout:   cfg.Timeout,
+			Transport: transport,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				// Redirects are handled manually (see handleRedirect) so
 				// that 3xx responses are reported as their own status
@@ -158,6 +218,12 @@ func New(cfg Config) *Crawler {
 			},
 		},
 	}
+}
+
+// PagesLimited reports whether Config.MaxPages caused one or more
+// discovered URLs to be dropped during the most recent Run.
+func (c *Crawler) PagesLimited() bool {
+	return c.state.LimitReached()
 }
 
 // Run crawls the site rooted at rawTargetURL and blocks until the crawl
@@ -176,6 +242,11 @@ func (c *Crawler) Run(ctx context.Context, rawTargetURL string) ([]Result, error
 	normalizedRoot, err := NormalizeURL(rootURL.String())
 	if err != nil {
 		return nil, fmt.Errorf("normalizing target URL: %w", err)
+	}
+
+	if c.cfg.RespectRobots {
+		c.robots = fetchRobots(ctx, c.client, rootURL, c.cfg.UserAgent)
+		c.logger.Debugf("robots.txt: %d disallow rule(s) apply to User-agent: *", len(c.robots.disallow))
 	}
 
 	c.jobs = make(chan Job, c.cfg.Concurrency*4)
@@ -267,7 +338,16 @@ func (c *Crawler) process(ctx context.Context, job Job, rootHost string) {
 
 	if result.LinkType == External && c.cfg.IgnoreExternal {
 		result.Skipped = true
+		result.SkipReason = "ignore-external"
 		c.logger.Debugf("skipping external link (--ignore-external): %s", job.URL)
+		c.emit(ctx, result)
+		return
+	}
+
+	if result.LinkType == Internal && c.robots.Disallowed(requestPath(job.URL)) {
+		result.Skipped = true
+		result.SkipReason = "robots.txt"
+		c.logger.Debugf("skipping (disallowed by robots.txt): %s", job.URL)
 		c.emit(ctx, result)
 		return
 	}
@@ -280,7 +360,7 @@ func (c *Crawler) process(ctx context.Context, job Job, rootHost string) {
 		c.emit(ctx, result)
 		return
 	}
-	req.Header.Set("User-Agent", "link-auditor/1.0 (+https://github.com/stackadnan/link-auditor)")
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
 
 	start := time.Now()
 	resp, err := c.client.Do(req)
@@ -298,13 +378,14 @@ func (c *Crawler) process(ctx context.Context, job Job, rootHost string) {
 	switch {
 	case isRedirect(resp.StatusCode):
 		c.handleRedirect(ctx, job, resp, &result, rootHost)
-		drain(resp.Body)
+		drain(resp.Body, c.cfg.MaxBodyBytes)
 	case result.LinkType == Internal && job.Depth < c.cfg.MaxDepth && isCrawlableHTML(resp):
+		result.Crawled = true
 		c.discoverLinks(ctx, job, resp)
 	default:
 		// Drain (rather than merely close) the body so the underlying
 		// connection can be returned to the client's pool for reuse.
-		drain(resp.Body)
+		drain(resp.Body, c.cfg.MaxBodyBytes)
 	}
 
 	c.emit(ctx, result)
@@ -345,9 +426,12 @@ func (c *Crawler) handleRedirect(ctx context.Context, job Job, resp *http.Respon
 }
 
 // discoverLinks parses an HTML response body for anchor links and enqueues
-// any newly discovered internal URLs.
+// any newly discovered internal URLs. The body is read up to
+// Config.MaxBodyBytes; a page larger than that is parsed on a best-effort
+// basis using whatever was read, the same way malformed HTML already is
+// (see ExtractLinks), rather than buffering the whole thing first.
 func (c *Crawler) discoverLinks(ctx context.Context, job Job, resp *http.Response) {
-	links, err := ExtractLinks(resp.Body, resp.Request.URL)
+	links, err := ExtractLinks(io.LimitReader(resp.Body, c.cfg.MaxBodyBytes), resp.Request.URL)
 	if err != nil {
 		c.logger.Debugf("error parsing HTML from %s: %v", job.URL, err)
 	}
@@ -402,11 +486,21 @@ func isCrawlableHTML(resp *http.Response) bool {
 	return strings.Contains(strings.ToLower(contentType), "text/html")
 }
 
-// drain discards up to maxRedirectBodyBytes of body, allowing the
-// connection to be reused by the HTTP client's transport without paying
-// the cost of buffering an unbounded response.
-func drain(body io.ReadCloser) {
-	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxRedirectBodyBytes))
+// drain discards up to maxBytes of body, allowing the connection to be
+// reused by the HTTP client's transport without paying the cost of
+// buffering an unbounded response.
+func drain(body io.ReadCloser, maxBytes int64) {
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, maxBytes))
+}
+
+// requestPath extracts the URL path robots.txt rules are matched against,
+// defaulting to "/" for a URL with no path component.
+func requestPath(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Path == "" {
+		return "/"
+	}
+	return u.Path
 }
 
 // describeError normalizes low-level network errors (timeouts, DNS

@@ -1,6 +1,7 @@
 package crawler
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 )
@@ -35,7 +36,7 @@ func TestState_MarkVisited_Deduplicates(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s := NewState()
+			s := NewState(0)
 			newlyMarked := 0
 			for _, u := range tt.urls {
 				if s.MarkVisited(u) {
@@ -53,7 +54,7 @@ func TestState_MarkVisited_Deduplicates(t *testing.T) {
 }
 
 func TestState_MarkVisited_FirstCallerWins(t *testing.T) {
-	s := NewState()
+	s := NewState(0)
 	if !s.MarkVisited("https://example.com/") {
 		t.Fatal("first MarkVisited call should return true")
 	}
@@ -72,7 +73,7 @@ func TestState_MarkVisited_ConcurrentSafe(t *testing.T) {
 		uniqueURL = 20
 	)
 
-	s := NewState()
+	s := NewState(0)
 	var wins [uniqueURL]int32
 	var mu sync.Mutex // guards wins from concurrent increment races in the test itself
 
@@ -100,6 +101,58 @@ func TestState_MarkVisited_ConcurrentSafe(t *testing.T) {
 	}
 	if got := s.Count(); got != uniqueURL {
 		t.Errorf("Count() = %d, want %d", got, uniqueURL)
+	}
+}
+
+// TestState_MarkVisited_PageBudget verifies that a positive maxPages caps
+// the number of URLs MarkVisited admits, that URLs beyond the budget are
+// rejected (not merely deferred), and that LimitReached reports the
+// boundary crossing exactly once it happens.
+func TestState_MarkVisited_PageBudget(t *testing.T) {
+	s := NewState(2)
+
+	if !s.MarkVisited("https://example.com/a") {
+		t.Fatal("first URL within budget should be admitted")
+	}
+	if s.LimitReached() {
+		t.Fatal("LimitReached should be false before the budget is exhausted")
+	}
+	if !s.MarkVisited("https://example.com/b") {
+		t.Fatal("second URL within budget should be admitted")
+	}
+	if s.MarkVisited("https://example.com/c") {
+		t.Fatal("third URL exceeds the budget of 2 and should be rejected")
+	}
+	if !s.LimitReached() {
+		t.Fatal("LimitReached should be true once the budget is exhausted")
+	}
+	if got := s.Count(); got != 2 {
+		t.Errorf("Count() = %d, want 2 (rejected URLs must not be recorded)", got)
+	}
+
+	// A URL rejected once for being over budget stays rejected; the budget
+	// never frees up mid-crawl.
+	if s.MarkVisited("https://example.com/c") {
+		t.Fatal("a URL rejected once for exceeding the budget must stay rejected")
+	}
+}
+
+// TestState_MarkVisited_ZeroMeansUnlimited verifies the documented sentinel:
+// maxPages == 0 never rejects a URL for budget reasons, no matter how many
+// distinct URLs are admitted.
+func TestState_MarkVisited_ZeroMeansUnlimited(t *testing.T) {
+	s := NewState(0)
+	const n = 500
+	for i := 0; i < n; i++ {
+		if !s.MarkVisited(fmt.Sprintf("https://example.com/page/%d", i)) {
+			t.Fatalf("URL %d should have been newly admitted", i)
+		}
+	}
+	if s.LimitReached() {
+		t.Error("LimitReached should never be true when maxPages is 0 (unlimited)")
+	}
+	if got := s.Count(); got != n {
+		t.Errorf("Count() = %d, want %d", got, n)
 	}
 }
 
