@@ -26,3 +26,4 @@ Thumbs.db
 # Environment files that might carry secrets
 .env
 .env.local
+my_plan.md
